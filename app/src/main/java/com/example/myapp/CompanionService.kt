@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
@@ -63,6 +64,7 @@ class CompanionService : Service() {
     private var tEnd = 0L
     private var tResults = 0L
     private var tSentence = 0L
+    private var awakeUntil = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -155,6 +157,7 @@ class CompanionService : Service() {
         if (turnOpen && streamDone && pending <= 0) {
             turnOpen = false
             abandonFocus()
+            awakeUntil = SystemClock.elapsedRealtime() + prefs.followUp * 1000L
             main.postDelayed({ startListening() }, 400)
         }
     }
@@ -198,7 +201,13 @@ class CompanionService : Service() {
             recognizer = SpeechRecognizer.createSpeechRecognizer(this).also { it.setRecognitionListener(listener) }
         }
         tEnd = 0L
-        CompanionState.update { it.copy(status = "Listening...") }
+        val w = prefs.wake.trim()
+        val label = when {
+            w.isEmpty() -> "Listening..."
+            SystemClock.elapsedRealtime() < awakeUntil -> "Awake - go ahead..."
+            else -> "Waiting for \"$w\"..."
+        }
+        CompanionState.update { it.copy(status = label) }
         val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
@@ -228,13 +237,30 @@ class CompanionService : Service() {
             ?.firstOrNull()?.trim().orEmpty()
         if (text.isEmpty()) { startListening(); return }
 
-        val wake = prefs.wake.trim().lowercase()
-        if (wake.isNotEmpty() && !text.lowercase().contains(wake)) {
+        val wake = prefs.wake.trim()
+        if (wake.isEmpty()) { respond(text); return }
+
+        val now = SystemClock.elapsedRealtime()
+        val hasWake = text.contains(wake, ignoreCase = true)
+        if (!hasWake && now >= awakeUntil) {
             CompanionState.update { it.copy(heard = "(ignored) $text") }
             startListening()
             return
         }
-        respond(text)
+        val stripped = text
+            .replace(Regex(Regex.escape(wake), RegexOption.IGNORE_CASE), "")
+            .trim { it in " ,.!?:;-" }
+        if (stripped.isEmpty()) {
+            // Wake phrase on its own: chime, then wait for the actual question
+            awakeUntil = now + 10_000
+            try {
+                ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80).startTone(ToneGenerator.TONE_PROP_ACK, 120)
+            } catch (e: Exception) { }
+            CompanionState.update { it.copy(heard = text) }
+            main.postDelayed({ startListening() }, 300)
+            return
+        }
+        respond(stripped)
     }
 
     // ---------- Gemini ----------

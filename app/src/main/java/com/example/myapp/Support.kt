@@ -41,6 +41,11 @@ class Prefs(ctx: Context) {
         get() = sp.getString("wake", "") ?: ""
         set(v) { sp.edit().putString("wake", v).apply() }
 
+    // seconds to stay awake after a reply, so follow-ups need no wake phrase (0 = off)
+    var followUp: Int
+        get() = sp.getInt("followup", 10)
+        set(v) { sp.edit().putInt("followup", v).apply() }
+
     // false = duck other audio, true = pause other audio while speaking
     var pause: Boolean
         get() = sp.getBoolean("pause", false)

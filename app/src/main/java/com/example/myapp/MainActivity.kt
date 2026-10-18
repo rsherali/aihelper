@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
@@ -32,6 +33,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -53,12 +55,14 @@ fun CompanionScreen() {
     var key by remember { mutableStateOf(prefs.apiKey) }
     var model by remember { mutableStateOf(prefs.model) }
     var wake by remember { mutableStateOf(prefs.wake) }
+    var followUp by remember { mutableStateOf(prefs.followUp.toString()) }
     var pause by remember { mutableStateOf(prefs.pause) }
 
     fun save() {
         prefs.apiKey = key.trim()
         prefs.model = model.trim()
         prefs.wake = wake.trim()
+        prefs.followUp = followUp.toIntOrNull() ?: 10
         prefs.pause = pause
     }
 
@@ -93,6 +97,12 @@ fun CompanionScreen() {
         OutlinedTextField(
             value = wake, onValueChange = { wake = it },
             label = { Text("Wake phrase (blank = answer everything)") },
+            singleLine = true, modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedTextField(
+            value = followUp, onValueChange = { followUp = it },
+            label = { Text("Follow-up window, seconds (0 = off)") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             singleLine = true, modifier = Modifier.fillMaxWidth()
         )
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
