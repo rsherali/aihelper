@@ -9,20 +9,19 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioTrack
 import android.media.ToneGenerator
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
-import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.util.Base64
 import android.view.KeyEvent
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -37,20 +36,23 @@ class CompanionService : Service() {
 
     companion object {
         const val ACTION_STOP = "com.example.myapp.STOP"
+        const val ACTION_ASK = "com.example.myapp.ASK"
         private const val CHANNEL = "companion"
         private const val NOTIF_ID = 1
-        private const val ARM_MS = 10_000L
+        private const val ASK_WAIT_MS = 8_000L
+        private const val REFRESH_MS = 15_000L
+        private const val READY = "Ready - press your earbud button"
     }
 
     private val main = Handler(Looper.getMainLooper())
     private lateinit var prefs: Prefs
     private lateinit var audio: AudioManager
-    private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var worker: ExecutorService? = null
     private var session: MediaSession? = null
+    private var silent: AudioTrack? = null
     private var active = false
-    private var listening = false
+    private var capturing = false
 
     private val attrs = AudioAttributes.Builder()
         .setUsage(AudioAttributes.USAGE_ASSISTANT)
@@ -72,9 +74,12 @@ class CompanionService : Service() {
     )
 
     private val history = JSONArray()
+    private val rawBuf = StringBuilder()
     private val replyBuf = StringBuilder()
     private val sentenceBuf = StringBuilder()
     private val boundary = Regex("(?<=[.!?])\\s+|\\n+")
+    private var heardText = ""
+    private var transcriptDone = false
     private var pending = 0
     private var streamDone = false
     private var turnOpen = false
@@ -82,17 +87,15 @@ class CompanionService : Service() {
     @Volatile private var turnId = 0
     private var utteranceCounter = 0
     private var firstAudioLogged = false
-    private var tEnd = 0L
-    private var tResults = 0L
+    private var tCaptured = 0L
     private var tSentence = 0L
-    private var awakeUntil = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            shutdown()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> { shutdown(); return START_NOT_STICKY }
+            ACTION_ASK -> { if (active) main.post { onButton() }; return START_NOT_STICKY }
         }
         if (active) return START_NOT_STICKY
 
@@ -101,7 +104,6 @@ class CompanionService : Service() {
         startInForeground()
 
         if (prefs.apiKey.isBlank()) { fail("Add your Gemini API key first"); return START_NOT_STICKY }
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) { fail("No speech recognition service on this phone"); return START_NOT_STICKY }
 
         active = true
         worker = Executors.newCachedThreadPool()
@@ -118,21 +120,32 @@ class CompanionService : Service() {
             this, 0, Intent(this, CompanionService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE
         )
+        val ask = PendingIntent.getService(
+            this, 1, Intent(this, CompanionService::class.java).setAction(ACTION_ASK),
+            PendingIntent.FLAG_IMMUTABLE
+        )
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
         val n: Notification = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentTitle("Companion is on")
-            .setContentText("Listening for your questions")
+            .setContentText("Press your earbud button or tap Ask")
             .setOngoing(true)
             .setContentIntent(open)
+            .addAction(0, "Ask", ask)
             .addAction(0, "Stop", stop)
             .build()
         ServiceCompat.startForeground(this, NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
     }
 
     // ---------- Earbud / headset button ----------
+    private fun pbState(st: Int): PlaybackState =
+        PlaybackState.Builder()
+            .setActions(PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE)
+            .setState(st, 0L, 1f)
+            .build()
+
     private fun startMediaSession() {
         val s = MediaSession(this, "CompanionSession")
         s.setCallback(object : MediaSession.Callback() {
@@ -145,26 +158,68 @@ class CompanionService : Service() {
                 return super.onMediaButtonEvent(mediaButtonIntent)
             }
         })
-        s.setPlaybackState(
-            PlaybackState.Builder()
-                .setActions(PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE)
-                .setState(PlaybackState.STATE_PLAYING, 0L, 1f)
-                .build()
-        )
+        s.setPlaybackState(pbState(PlaybackState.STATE_PLAYING))
         s.isActive = true
         session = s
+        startSilent()
+    }
+
+    // Android sends the headset button to the app that most recently played audio, so we keep
+    // a silent looping track and periodically re-assert ourselves while idle.
+    private fun startSilent() {
+        stopSilent()
+        try {
+            val rate = 8000
+            val bytes = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                .coerceAtLeast(2048)
+            val t = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(rate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .build()
+                )
+                .setBufferSizeInBytes(bytes)
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .build()
+            t.write(ByteArray(bytes), 0, bytes)
+            t.setLoopPoints(0, bytes / 2, -1)
+            t.play()
+            silent = t
+        } catch (e: Exception) { }
+    }
+
+    private fun stopSilent() {
+        try { silent?.stop() } catch (e: Exception) { }
+        try { silent?.release() } catch (e: Exception) { }
+        silent = null
+    }
+
+    private val refresh = object : Runnable {
+        override fun run() {
+            if (!active) return
+            if (session != null && !turnOpen && !capturing) {
+                session?.setPlaybackState(pbState(PlaybackState.STATE_PAUSED))
+                session?.setPlaybackState(pbState(PlaybackState.STATE_PLAYING))
+                startSilent()
+            }
+            main.postDelayed(this, REFRESH_MS)
+        }
     }
 
     private fun onButton() {
         if (!active) return
-        if (turnOpen) interrupt()   // thinking or speaking: cut it off
-        arm()                       // then listen for the next thing, no wake phrase needed
-    }
-
-    private fun arm() {
-        awakeUntil = SystemClock.elapsedRealtime() + ARM_MS
+        if (capturing) { chime(); return }      // already listening
+        if (turnOpen) interrupt()               // thinking or speaking: cut it off
         chime()
-        main.postDelayed({ startListening() }, 300)
+        main.postDelayed({ startCapture(ASK_WAIT_MS) }, 300)
     }
 
     private fun chime() {
@@ -173,28 +228,77 @@ class CompanionService : Service() {
         } catch (e: Exception) { }
     }
 
-    // ---------- Interrupt ----------
+    // ---------- Capture (own mic capture: no audio focus, so music is not disturbed) ----------
+    private fun startCapture(waitMs: Long) {
+        if (!active || capturing || turnOpen) return
+        if (audio.mode in callModes) {
+            CompanionState.update { it.copy(status = "Paused: call in progress") }
+            return
+        }
+        capturing = true
+        turnId++
+        val myTurn = turnId
+        CompanionState.update { it.copy(status = "Listening...", error = "") }
+        worker?.execute {
+            try {
+                val wav = Recorder.capture(waitMs) { myTurn != turnId || !active }
+                main.post { onCaptured(myTurn, wav) }
+            } catch (e: Exception) {
+                main.post { onCaptureError(myTurn, e) }
+            }
+        }
+    }
+
+    private fun onCaptured(id: Int, wav: ByteArray?) {
+        if (!active || id != turnId) return
+        capturing = false
+        if (wav == null) {
+            CompanionState.update { it.copy(status = READY) }
+            return
+        }
+        tCaptured = SystemClock.elapsedRealtime()
+        respondAudio(wav)
+    }
+
+    private fun onCaptureError(id: Int, e: Exception) {
+        if (!active || id != turnId) return
+        capturing = false
+        CompanionState.update { it.copy(error = e.message ?: "Capture failed", status = READY) }
+    }
+
+    // ---------- Interrupt / abort ----------
     private fun interrupt() {
-        turnId++                       // invalidates the in-flight stream and queued speech
+        turnId++                       // invalidates in-flight capture, stream and queued speech
         tts?.stop()
         pending = 0
-        if (turnOpen && !replyCommitted) {
-            if (replyBuf.isBlank()) removeLastHistory() else commitReply()
-            replyCommitted = true
-        }
+        if (turnOpen && !replyCommitted && replyBuf.isNotBlank()) commitTurn()
+        replyCommitted = true
         turnOpen = false
+        capturing = false
         streamDone = true
         abandonFocus()
         CompanionState.update { it.copy(status = "Interrupted") }
     }
 
-    private fun removeLastHistory() {
-        if (history.length() > 0) history.remove(history.length() - 1)
+    private fun abort(status: String) {
+        turnId++
+        tts?.stop()
+        pending = 0
+        replyCommitted = true
+        turnOpen = false
+        capturing = false
+        streamDone = true
+        abandonFocus()
+        CompanionState.update { it.copy(status = "$status - press your earbud button") }
     }
 
-    private fun commitReply() {
-        history.put(JSONObject().put("role", "model")
-            .put("parts", JSONArray().put(JSONObject().put("text", replyBuf.toString()))))
+    private fun msg(role: String, text: String): JSONObject =
+        JSONObject().put("role", role).put("parts", JSONArray().put(JSONObject().put("text", text)))
+
+    private fun commitTurn() {
+        history.put(msg("user", "(spoken audio)"))
+        history.put(msg("model", "HEARD: $heardText\n$replyBuf"))
+        while (history.length() > 20) { history.remove(0); history.remove(0) }
     }
 
     // ---------- TTS ----------
@@ -209,7 +313,8 @@ class CompanionService : Service() {
             @Deprecated("Deprecated in Java")
             override fun onError(utteranceId: String?) { main.post { onUtteranceFinished(utteranceId) } }
         })
-        startListening()
+        CompanionState.update { it.copy(status = READY) }
+        main.postDelayed(refresh, REFRESH_MS)
     }
 
     private fun isCurrent(id: String?): Boolean = id?.substringBefore(":")?.toIntOrNull() == turnId
@@ -228,10 +333,9 @@ class CompanionService : Service() {
         if (!firstAudioLogged) {
             firstAudioLogged = true
             val now = SystemClock.elapsedRealtime()
-            val stt = if (tEnd > 0) tResults - tEnd else -1
-            val llm = tSentence - tResults
+            val llm = tSentence - tCaptured
             val ttsMs = now - tSentence
-            CompanionState.update { it.copy(sttMs = stt, llmMs = llm, ttsMs = ttsMs) }
+            CompanionState.update { it.copy(sttMs = -1, llmMs = llm, ttsMs = ttsMs) }
         }
         CompanionState.update { it.copy(status = "Speaking...") }
     }
@@ -246,12 +350,13 @@ class CompanionService : Service() {
         if (turnOpen && streamDone && pending <= 0) {
             turnOpen = false
             abandonFocus()
-            awakeUntil = SystemClock.elapsedRealtime() + prefs.followUp * 1000L
-            main.postDelayed({ startListening() }, 400)
+            CompanionState.update { it.copy(status = READY) }
+            val follow = prefs.followUp
+            if (follow > 0) main.postDelayed({ startCapture(follow * 1000L) }, 400)
         }
     }
 
-    // ---------- Audio focus ----------
+    // ---------- Audio focus (only while we speak) ----------
     private fun requestFocus() {
         if (hasFocus) return
         val type = if (prefs.pause) AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE
@@ -266,11 +371,10 @@ class CompanionService : Service() {
     }
 
     private fun onFocusChange(change: Int) {
-        // Something else (e.g. a phone call) took the audio: stop talking, then wait
+        // Something else (e.g. a phone call) took the audio: stop talking
         if (!active || !hasFocus) return
         if (change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
             interrupt()
-            main.postDelayed({ startListening() }, 500)
         }
     }
 
@@ -280,110 +384,18 @@ class CompanionService : Service() {
         hasFocus = false
     }
 
-    // ---------- Speech recognition ----------
-    private val listener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {}
-        override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(rmsdB: Float) {}
-        override fun onBufferReceived(buffer: ByteArray?) {}
-        override fun onEndOfSpeech() { tEnd = SystemClock.elapsedRealtime() }
-        override fun onError(error: Int) { handleSttError(error) }
-        override fun onResults(results: Bundle?) { handleResults(results) }
-        override fun onPartialResults(partialResults: Bundle?) {}
-        override fun onEvent(eventType: Int, params: Bundle?) {}
-    }
-
-    private fun startListening() {
-        if (!active || listening || turnOpen) return
-        if (audio.mode in callModes) {
-            CompanionState.update { it.copy(status = "Paused: call in progress") }
-            main.postDelayed({ startListening() }, 2000)
-            return
-        }
-        if (recognizer == null) {
-            recognizer = SpeechRecognizer.createSpeechRecognizer(this).also { it.setRecognitionListener(listener) }
-        }
-        tEnd = 0L
-        val w = prefs.wake.trim()
-        val label = when {
-            w.isEmpty() -> "Listening..."
-            SystemClock.elapsedRealtime() < awakeUntil -> "Awake - go ahead..."
-            else -> "Waiting for \"$w\"..."
-        }
-        CompanionState.update { it.copy(status = label) }
-        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
-        }
-        listening = true
-        recognizer?.startListening(i)
-    }
-
-    private fun handleSttError(error: Int) {
-        listening = false
-        if (!active) return
-        when (error) {
-            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> fail("Microphone permission missing")
-            SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
-                main.postDelayed({ startListening() }, 200)
-            else -> {
-                CompanionState.update { it.copy(error = "Speech recogniser error $error, retrying") }
-                recognizer?.destroy()
-                recognizer = null
-                main.postDelayed({ startListening() }, 1000)
-            }
-        }
-    }
-
+    // ---------- Gemini (audio in, streamed text out) ----------
     private fun isStopPhrase(t: String): Boolean {
         val norm = t.lowercase().replace('\u2019', '\'').trim { !it.isLetterOrDigit() }
         return norm in stopPhrases
     }
 
-    private fun handleResults(results: Bundle?) {
-        listening = false
-        if (!active) return
-        tResults = SystemClock.elapsedRealtime()
-        val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            ?.firstOrNull()?.trim().orEmpty()
-        if (text.isEmpty()) { startListening(); return }
-
-        val wake = prefs.wake.trim()
-        val now = SystemClock.elapsedRealtime()
-        val hasWake = wake.isNotEmpty() && text.contains(wake, ignoreCase = true)
-        if (wake.isNotEmpty() && !hasWake && now >= awakeUntil) {
-            CompanionState.update { it.copy(heard = "(ignored) $text") }
-            startListening()
-            return
-        }
-        val core = if (hasWake) {
-            text.replace(Regex(Regex.escape(wake), RegexOption.IGNORE_CASE), "")
-                .trim { it in " ,.!?:;-" }
-        } else text
-
-        if (isStopPhrase(core)) {            // "stop", "that's all" ends the conversation window
-            awakeUntil = 0L
-            CompanionState.update { it.copy(heard = text) }
-            startListening()
-            return
-        }
-        if (core.isEmpty()) {                // wake phrase on its own: wait for the question
-            CompanionState.update { it.copy(heard = text) }
-            arm()
-            return
-        }
-        respond(core)
-    }
-
-    // ---------- Gemini ----------
-    private fun respond(text: String) {
-        history.put(JSONObject().put("role", "user").put("parts", JSONArray().put(JSONObject().put("text", text))))
-        while (history.length() > 20) { history.remove(0); history.remove(0) }
-
-        turnId++
-        val myTurn = turnId
+    private fun respondAudio(wav: ByteArray) {
+        rawBuf.clear()
         replyBuf.clear()
         sentenceBuf.clear()
+        heardText = ""
+        transcriptDone = false
         pending = 0
         streamDone = false
         turnOpen = true
@@ -391,10 +403,18 @@ class CompanionService : Service() {
         firstAudioLogged = false
         tSentence = 0L
         CompanionState.update {
-            it.copy(heard = text, reply = "", status = "Thinking...", error = "", sttMs = -1, llmMs = -1, ttsMs = -1)
+            it.copy(heard = "", reply = "", status = "Thinking...", error = "", sttMs = -1, llmMs = -1, ttsMs = -1)
         }
 
-        val snapshot = JSONArray(history.toString())
+        val myTurn = turnId
+        val audioTurn = JSONObject().put("role", "user").put(
+            "parts", JSONArray()
+                .put(JSONObject().put("inline_data", JSONObject()
+                    .put("mime_type", "audio/wav")
+                    .put("data", Base64.encodeToString(wav, Base64.NO_WRAP))))
+                .put(JSONObject().put("text", "(Answer the audio above using the required format.)"))
+        )
+        val snapshot = JSONArray(history.toString()).put(audioTurn)
         val key = prefs.apiKey
         val model = prefs.model
         worker?.execute {
@@ -409,10 +429,39 @@ class CompanionService : Service() {
         }
     }
 
+    private fun acceptTranscript(line: String) {
+        transcriptDone = true
+        val t = line.replace(Regex("^\\s*HEARD:\\s*", RegexOption.IGNORE_CASE), "").trim()
+        heardText = t
+        CompanionState.update { it.copy(heard = t) }
+        if (t.isEmpty() || t.startsWith("(nothing", ignoreCase = true)) abort("Didn't catch that")
+        else if (isStopPhrase(t)) abort("OK")
+    }
+
     private fun onChunk(id: Int, chunk: String) {
         if (!active || id != turnId) return
-        replyBuf.append(chunk)
-        sentenceBuf.append(chunk)
+        if (!transcriptDone) {
+            rawBuf.append(chunk)
+            val s = rawBuf.toString()
+            val nl = s.indexOf('\n')
+            if (nl >= 0) {
+                acceptTranscript(s.substring(0, nl))
+                if (!active || id != turnId) return
+                feedReply(s.substring(nl + 1))
+            } else if (s.length > 400 && !s.trimStart().startsWith("HEARD", ignoreCase = true)) {
+                transcriptDone = true
+                heardText = "(spoken)"
+                feedReply(s)
+            }
+            return
+        }
+        feedReply(chunk)
+    }
+
+    private fun feedReply(text: String) {
+        if (text.isEmpty()) return
+        replyBuf.append(text)
+        sentenceBuf.append(text)
         CompanionState.update { it.copy(reply = replyBuf.toString()) }
         drain(false)
     }
@@ -427,13 +476,19 @@ class CompanionService : Service() {
 
     private fun onStreamEnd(id: Int) {
         if (!active || id != turnId) return
-        drain(true)
-        if (replyBuf.isBlank()) {
-            removeLastHistory()
-            speak("Sorry, I didn't get an answer.")
-        } else {
-            commitReply()
+        if (!transcriptDone) {
+            val s = rawBuf.toString().trim()
+            if (s.startsWith("HEARD", ignoreCase = true)) {
+                acceptTranscript(s)
+                if (id != turnId) return
+            } else {
+                transcriptDone = true
+                heardText = "(spoken)"
+                feedReply(s)
+            }
         }
+        drain(true)
+        if (replyBuf.isBlank()) speak("Sorry, I didn't get an answer.") else commitTurn()
         replyCommitted = true
         streamDone = true
         checkFinish()
@@ -441,7 +496,6 @@ class CompanionService : Service() {
 
     private fun onStreamError(id: Int, e: Exception) {
         if (!active || id != turnId) return
-        removeLastHistory()
         replyCommitted = true
         CompanionState.update { it.copy(error = e.message ?: "Unknown error") }
         speak("Sorry, I couldn't reach Gemini.")
@@ -458,13 +512,13 @@ class CompanionService : Service() {
     private fun shutdown() {
         active = false
         turnOpen = false
-        listening = false
+        capturing = false
+        turnId++
         main.removeCallbacksAndMessages(null)
         session?.isActive = false
         session?.release()
         session = null
-        recognizer?.destroy()
-        recognizer = null
+        stopSilent()
         tts?.stop()
         tts?.shutdown()
         tts = null

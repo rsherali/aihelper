@@ -54,7 +54,6 @@ fun CompanionScreen() {
 
     var key by remember { mutableStateOf(prefs.apiKey) }
     var model by remember { mutableStateOf(prefs.model) }
-    var wake by remember { mutableStateOf(prefs.wake) }
     var followUp by remember { mutableStateOf(prefs.followUp.toString()) }
     var button by remember { mutableStateOf(prefs.buttonTrigger) }
     var pause by remember { mutableStateOf(prefs.pause) }
@@ -62,7 +61,6 @@ fun CompanionScreen() {
     fun save() {
         prefs.apiKey = key.trim()
         prefs.model = model.trim()
-        prefs.wake = wake.trim()
         prefs.followUp = followUp.toIntOrNull() ?: 10
         prefs.buttonTrigger = button
         prefs.pause = pause
@@ -97,11 +95,6 @@ fun CompanionScreen() {
             label = { Text("Model") }, singleLine = true, modifier = Modifier.fillMaxWidth()
         )
         OutlinedTextField(
-            value = wake, onValueChange = { wake = it },
-            label = { Text("Wake phrase (blank = answer everything)") },
-            singleLine = true, modifier = Modifier.fillMaxWidth()
-        )
-        OutlinedTextField(
             value = followUp, onValueChange = { followUp = it },
             label = { Text("Follow-up window, seconds (0 = off)") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -129,6 +122,13 @@ fun CompanionScreen() {
             }
         ) { Text(if (ui.running) "Stop companion" else "Start companion") }
 
+        if (ui.running) {
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = { ctx.startService(Intent(ctx, CompanionService::class.java).setAction(CompanionService.ACTION_ASK)) }
+            ) { Text("Ask now (same as the earbud button)") }
+        }
+
         OutlinedButton(
             modifier = Modifier.fillMaxWidth(),
             onClick = { ctx.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
@@ -138,8 +138,7 @@ fun CompanionScreen() {
         if (ui.heard.isNotEmpty()) Text("Heard: ${ui.heard}")
         if (ui.reply.isNotEmpty()) Text("Reply: ${ui.reply}")
         if (ui.ttsMs >= 0) {
-            val total = (if (ui.sttMs >= 0) ui.sttMs else 0) + ui.llmMs + ui.ttsMs
-            Text("Latency: speech-recognition ${ui.sttMs} ms | Gemini ${ui.llmMs} ms | voice start ${ui.ttsMs} ms | total ~$total ms")
+            Text("Latency: Gemini ${ui.llmMs} ms | voice start ${ui.ttsMs} ms | total ~${ui.llmMs + ui.ttsMs} ms (after you stop speaking)")
         }
         if (ui.error.isNotEmpty()) Text("Error: ${ui.error}", color = MaterialTheme.colorScheme.error)
     }

@@ -1,9 +1,13 @@
 package com.example.myapp
 
 import android.content.Context
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import kotlinx.coroutines.flow.MutableStateFlow
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -60,8 +64,12 @@ class Prefs(ctx: Context) {
 object GeminiClient {
     private const val SYSTEM =
         "You are a friendly companion speaking in the user's ear while they go about their day. " +
-        "Reply in one to three short, natural spoken sentences. No markdown, lists or emojis. " +
-        "If the user changes subject, follow them. Be direct and accurate, and say so if unsure."
+        "The user's latest message is a short audio clip of them speaking to you. " +
+        "OUTPUT FORMAT: the first line must be exactly 'HEARD: ' followed by a verbatim transcript of what they said. " +
+        "If there is no clear speech directed at you (silence, music, background noise, other people), output only 'HEARD: (nothing)'. " +
+        "Otherwise put your spoken reply after a newline: one to three short, natural sentences, no markdown, lists or emojis. " +
+        "If the user changes subject, follow them. Be direct and accurate, and say so if unsure. " +
+        "Earlier turns appear in the same HEARD format; keep using it."
 
     /** Streams the reply; calls onText for each text chunk. Throws on failure. */
     fun stream(apiKey: String, model: String, history: JSONArray, isCancelled: () -> Boolean, onText: (String) -> Unit) {
@@ -102,5 +110,95 @@ object GeminiClient {
         } finally {
             conn.disconnect()
         }
+    }
+}
+
+/** Captures one utterance from the phone mic with simple energy-based voice detection. Does NOT take audio focus. */
+object Recorder {
+    private const val RATE = 16000
+    private const val FRAME = 320 // 20 ms
+
+    /** Blocks; run off the main thread. Returns WAV bytes, or null if no speech began within waitMs. */
+    fun capture(waitMs: Long, isCancelled: () -> Boolean): ByteArray? {
+        val minBuf = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        val rec = AudioRecord(
+            MediaRecorder.AudioSource.MIC, RATE, AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuf, FRAME * 2 * 8)
+        )
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            rec.release()
+            throw RuntimeException("Microphone unavailable")
+        }
+        val pcm = ByteArrayOutputStream()
+        val buf = ShortArray(FRAME)
+        val pre = ArrayDeque<ShortArray>()
+        var noise = Double.MAX_VALUE
+        var threshold = 800.0
+        var frames = 0
+        var started = false
+        var voiced = 0
+        var quiet = 0
+        var speechFrames = 0
+        val waitFrames = (waitMs / 20).toInt()
+        try {
+            rec.startRecording()
+            while (!isCancelled()) {
+                val n = rec.read(buf, 0, FRAME)
+                if (n < 0) throw RuntimeException("Microphone read error $n")
+                if (n == 0) continue
+                val level = rms(buf, n)
+                frames++
+                if (frames <= 15) {
+                    noise = minOf(noise, level)
+                    if (frames == 15) threshold = (noise * 3.0).coerceIn(400.0, 2000.0)
+                }
+                if (!started) {
+                    pre.addLast(buf.copyOf(n))
+                    if (pre.size > 10) pre.removeFirst()
+                    if (frames >= 5 && level > threshold) {
+                        started = true
+                        for (f in pre) write(pcm, f)
+                        pre.clear()
+                        voiced = 1
+                        speechFrames = 1
+                    } else if (frames > waitFrames) {
+                        return null
+                    }
+                } else {
+                    write(pcm, buf.copyOf(n))
+                    speechFrames++
+                    if (level > threshold * 0.6) { voiced++; quiet = 0 } else quiet++
+                    if (quiet >= 45 || speechFrames >= 750) break   // ~0.9 s of quiet, or 15 s max
+                }
+            }
+            if (!started || voiced < 8) return null
+            return wav(pcm.toByteArray())
+        } finally {
+            try { rec.stop() } catch (e: Exception) { }
+            rec.release()
+        }
+    }
+
+    private fun rms(b: ShortArray, n: Int): Double {
+        var sum = 0.0
+        for (i in 0 until n) sum += b[i].toDouble() * b[i].toDouble()
+        return Math.sqrt(sum / n)
+    }
+
+    private fun write(out: ByteArrayOutputStream, shorts: ShortArray) {
+        for (sh in shorts) {
+            out.write(sh.toInt() and 0xFF)
+            out.write((sh.toInt() shr 8) and 0xFF)
+        }
+    }
+
+    private fun wav(pcm: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream()
+        fun i32(v: Int) { out.write(v and 255); out.write((v shr 8) and 255); out.write((v shr 16) and 255); out.write((v shr 24) and 255) }
+        fun i16(v: Int) { out.write(v and 255); out.write((v shr 8) and 255) }
+        out.write("RIFF".toByteArray()); i32(36 + pcm.size); out.write("WAVE".toByteArray())
+        out.write("fmt ".toByteArray()); i32(16); i16(1); i16(1); i32(RATE); i32(RATE * 2); i16(2); i16(16)
+        out.write("data".toByteArray()); i32(pcm.size); out.write(pcm)
+        return out.toByteArray()
     }
 }
