@@ -56,6 +56,7 @@ fun CompanionScreen() {
     var model by remember { mutableStateOf(prefs.model) }
     var wake by remember { mutableStateOf(prefs.wake) }
     var followUp by remember { mutableStateOf(prefs.followUp.toString()) }
+    var button by remember { mutableStateOf(prefs.buttonTrigger) }
     var pause by remember { mutableStateOf(prefs.pause) }
 
     fun save() {
@@ -63,6 +64,7 @@ fun CompanionScreen() {
         prefs.model = model.trim()
         prefs.wake = wake.trim()
         prefs.followUp = followUp.toIntOrNull() ?: 10
+        prefs.buttonTrigger = button
         prefs.pause = pause
     }
 
@@ -105,6 +107,10 @@ fun CompanionScreen() {
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             singleLine = true, modifier = Modifier.fillMaxWidth()
         )
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Switch(checked = button, onCheckedChange = { button = it })
+            Text("Earbud button = ask / interrupt")
+        }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Switch(checked = pause, onCheckedChange = { pause = it })
             Text(if (pause) "Pause other audio while speaking" else "Duck other audio while speaking")

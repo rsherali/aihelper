@@ -46,6 +46,11 @@ class Prefs(ctx: Context) {
         get() = sp.getInt("followup", 10)
         set(v) { sp.edit().putInt("followup", v).apply() }
 
+    // earbud/headset button = ask now, or interrupt while it is speaking
+    var buttonTrigger: Boolean
+        get() = sp.getBoolean("button", true)
+        set(v) { sp.edit().putBoolean("button", v).apply() }
+
     // false = duck other audio, true = pause other audio while speaking
     var pause: Boolean
         get() = sp.getBoolean("pause", false)
@@ -59,7 +64,7 @@ object GeminiClient {
         "If the user changes subject, follow them. Be direct and accurate, and say so if unsure."
 
     /** Streams the reply; calls onText for each text chunk. Throws on failure. */
-    fun stream(apiKey: String, model: String, history: JSONArray, onText: (String) -> Unit) {
+    fun stream(apiKey: String, model: String, history: JSONArray, isCancelled: () -> Boolean, onText: (String) -> Unit) {
         val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:streamGenerateContent?alt=sse")
         val conn = url.openConnection() as HttpURLConnection
         try {
@@ -81,6 +86,7 @@ object GeminiClient {
             }
             conn.inputStream.bufferedReader().useLines { lines ->
                 for (line in lines) {
+                    if (isCancelled()) break
                     if (!line.startsWith("data:")) continue
                     val json = line.removePrefix("data:").trim()
                     if (json.isEmpty()) continue
