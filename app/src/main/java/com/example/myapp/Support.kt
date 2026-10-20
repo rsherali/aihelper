@@ -55,6 +55,11 @@ class Prefs(ctx: Context) {
         get() = sp.getBoolean("button", true)
         set(v) { sp.edit().putBoolean("button", v).apply() }
 
+    // talk over it to interrupt (only used when headphones are connected)
+    var bargeIn: Boolean
+        get() = sp.getBoolean("barge", true)
+        set(v) { sp.edit().putBoolean("barge", v).apply() }
+
     // false = duck other audio, true = pause other audio while speaking
     var pause: Boolean
         get() = sp.getBoolean("pause", false)
@@ -119,7 +124,7 @@ object Recorder {
     private const val FRAME = 320 // 20 ms
 
     /** Blocks; run off the main thread. Returns WAV bytes, or null if no speech began within waitMs. */
-    fun capture(waitMs: Long, isCancelled: () -> Boolean): ByteArray? {
+    fun capture(waitMs: Long, isCancelled: () -> Boolean, onSpeech: () -> Unit = {}): ByteArray? {
         val minBuf = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         val rec = AudioRecord(
             MediaRecorder.AudioSource.MIC, RATE, AudioFormat.CHANNEL_IN_MONO,
@@ -167,7 +172,11 @@ object Recorder {
                 } else {
                     write(pcm, buf.copyOf(n))
                     speechFrames++
-                    if (level > threshold * 0.6) { voiced++; quiet = 0 } else quiet++
+                    if (level > threshold * 0.6) {
+                        voiced++
+                        quiet = 0
+                        if (voiced == 10) onSpeech()   // ~200 ms of speech: real, not a rustle
+                    } else quiet++
                     if (quiet >= 45 || speechFrames >= 750) break   // ~0.9 s of quiet, or 15 s max
                 }
             }

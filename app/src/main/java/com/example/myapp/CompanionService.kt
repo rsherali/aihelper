@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -52,7 +53,8 @@ class CompanionService : Service() {
     private var session: MediaSession? = null
     private var silent: AudioTrack? = null
     private var active = false
-    private var capturing = false
+    private var capturing = false   // recording a user utterance
+    private var watching = false    // listening for the user to talk over a reply
 
     private val attrs = AudioAttributes.Builder()
         .setUsage(AudioAttributes.USAGE_ASSISTANT)
@@ -84,7 +86,8 @@ class CompanionService : Service() {
     private var streamDone = false
     private var turnOpen = false
     private var replyCommitted = true
-    @Volatile private var turnId = 0
+    @Volatile private var replyId = 0
+    @Volatile private var capId = 0
     private var utteranceCounter = 0
     private var firstAudioLogged = false
     private var tCaptured = 0L
@@ -205,7 +208,7 @@ class CompanionService : Service() {
     private val refresh = object : Runnable {
         override fun run() {
             if (!active) return
-            if (session != null && !turnOpen && !capturing) {
+            if (session != null && !turnOpen && !capturing && !watching) {
                 session?.setPlaybackState(pbState(PlaybackState.STATE_PAUSED))
                 session?.setPlaybackState(pbState(PlaybackState.STATE_PLAYING))
                 startSilent()
@@ -216,8 +219,8 @@ class CompanionService : Service() {
 
     private fun onButton() {
         if (!active) return
-        if (capturing) { chime(); return }      // already listening
-        if (turnOpen) interrupt()               // thinking or speaking: cut it off
+        if (capturing) { chime(); return }          // already recording your question
+        if (turnOpen || watching) interrupt()       // thinking or speaking: cut it off
         chime()
         main.postDelayed({ startCapture(ASK_WAIT_MS) }, 300)
     }
@@ -229,31 +232,62 @@ class CompanionService : Service() {
     }
 
     // ---------- Capture (own mic capture: no audio focus, so music is not disturbed) ----------
-    private fun startCapture(waitMs: Long) {
-        if (!active || capturing || turnOpen) return
+    private fun headphonesConnected(): Boolean {
+        val types = setOf(
+            AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_WIRED_HEADSET,
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            AudioDeviceInfo.TYPE_USB_HEADSET, AudioDeviceInfo.TYPE_HEARING_AID,
+            AudioDeviceInfo.TYPE_BLE_HEADSET
+        )
+        return audio.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any { it.type in types }
+    }
+
+    /** watch = true: listen while a reply is playing; real speech cuts the reply off and becomes your next question. */
+    private fun startCapture(waitMs: Long, watch: Boolean = false) {
+        if (!active || capturing) return
+        if (!watch && turnOpen) return
         if (audio.mode in callModes) {
-            CompanionState.update { it.copy(status = "Paused: call in progress") }
+            if (!watch) CompanionState.update { it.copy(status = "Paused: call in progress") }
             return
         }
-        capturing = true
-        turnId++
-        val myTurn = turnId
-        CompanionState.update { it.copy(status = "Listening...", error = "") }
+        capId++
+        val myCap = capId
+        if (watch) {
+            watching = true
+        } else {
+            watching = false
+            capturing = true
+            CompanionState.update { it.copy(status = "Listening...", error = "") }
+        }
         worker?.execute {
             try {
-                val wav = Recorder.capture(waitMs) { myTurn != turnId || !active }
-                main.post { onCaptured(myTurn, wav) }
+                val wav = Recorder.capture(
+                    waitMs,
+                    { myCap != capId || !active },
+                    { main.post { onBargeDetected(myCap) } }
+                )
+                main.post { onCaptured(myCap, wav) }
             } catch (e: Exception) {
-                main.post { onCaptureError(myTurn, e) }
+                main.post { onCaptureError(myCap, e) }
             }
         }
     }
 
+    private fun onBargeDetected(id: Int) {
+        if (!active || id != capId || !watching) return
+        watching = false
+        capturing = true
+        stopReply()
+        CompanionState.update { it.copy(status = "Listening...") }
+    }
+
     private fun onCaptured(id: Int, wav: ByteArray?) {
-        if (!active || id != turnId) return
+        if (!active || id != capId) return
+        val wasWatching = watching
         capturing = false
-        if (wav == null) {
-            CompanionState.update { it.copy(status = READY) }
+        watching = false
+        if (wav == null || wasWatching) {
+            if (!turnOpen) CompanionState.update { it.copy(status = READY) }
             return
         }
         tCaptured = SystemClock.elapsedRealtime()
@@ -261,34 +295,38 @@ class CompanionService : Service() {
     }
 
     private fun onCaptureError(id: Int, e: Exception) {
-        if (!active || id != turnId) return
+        if (!active || id != capId) return
         capturing = false
+        watching = false
         CompanionState.update { it.copy(error = e.message ?: "Capture failed", status = READY) }
     }
 
     // ---------- Interrupt / abort ----------
-    private fun interrupt() {
-        turnId++                       // invalidates in-flight capture, stream and queued speech
+    /** Stops the current reply (speech and stream) but leaves any capture running. */
+    private fun stopReply() {
+        replyId++
         tts?.stop()
         pending = 0
         if (turnOpen && !replyCommitted && replyBuf.isNotBlank()) commitTurn()
         replyCommitted = true
         turnOpen = false
-        capturing = false
         streamDone = true
         abandonFocus()
+    }
+
+    private fun interrupt() {
+        stopReply()
+        capId++
+        capturing = false
+        watching = false
         CompanionState.update { it.copy(status = "Interrupted") }
     }
 
     private fun abort(status: String) {
-        turnId++
-        tts?.stop()
-        pending = 0
-        replyCommitted = true
-        turnOpen = false
+        stopReply()
+        capId++
         capturing = false
-        streamDone = true
-        abandonFocus()
+        watching = false
         CompanionState.update { it.copy(status = "$status - press your earbud button") }
     }
 
@@ -317,7 +355,7 @@ class CompanionService : Service() {
         main.postDelayed(refresh, REFRESH_MS)
     }
 
-    private fun isCurrent(id: String?): Boolean = id?.substringBefore(":")?.toIntOrNull() == turnId
+    private fun isCurrent(id: String?): Boolean = id?.substringBefore(":")?.toIntOrNull() == replyId
 
     private fun speak(text: String) {
         val clean = text.replace(Regex("[*#`]"), "").trim()
@@ -325,7 +363,7 @@ class CompanionService : Service() {
         if (tSentence == 0L) tSentence = SystemClock.elapsedRealtime()
         requestFocus()
         pending++
-        tts?.speak(clean, TextToSpeech.QUEUE_ADD, null, "$turnId:" + (utteranceCounter++))
+        tts?.speak(clean, TextToSpeech.QUEUE_ADD, null, "$replyId:" + (utteranceCounter++))
     }
 
     private fun onSpeechStarted(id: String?) {
@@ -336,6 +374,7 @@ class CompanionService : Service() {
             val llm = tSentence - tCaptured
             val ttsMs = now - tSentence
             CompanionState.update { it.copy(sttMs = -1, llmMs = llm, ttsMs = ttsMs) }
+            if (prefs.bargeIn && headphonesConnected()) startCapture(60_000L, watch = true)
         }
         CompanionState.update { it.copy(status = "Speaking...") }
     }
@@ -351,6 +390,7 @@ class CompanionService : Service() {
             turnOpen = false
             abandonFocus()
             CompanionState.update { it.copy(status = READY) }
+            if (watching) { capId++; watching = false }
             val follow = prefs.followUp
             if (follow > 0) main.postDelayed({ startCapture(follow * 1000L) }, 400)
         }
@@ -391,6 +431,7 @@ class CompanionService : Service() {
     }
 
     private fun respondAudio(wav: ByteArray) {
+        replyId++
         rawBuf.clear()
         replyBuf.clear()
         sentenceBuf.clear()
@@ -406,7 +447,7 @@ class CompanionService : Service() {
             it.copy(heard = "", reply = "", status = "Thinking...", error = "", sttMs = -1, llmMs = -1, ttsMs = -1)
         }
 
-        val myTurn = turnId
+        val myTurn = replyId
         val audioTurn = JSONObject().put("role", "user").put(
             "parts", JSONArray()
                 .put(JSONObject().put("inline_data", JSONObject()
@@ -419,7 +460,7 @@ class CompanionService : Service() {
         val model = prefs.model
         worker?.execute {
             try {
-                GeminiClient.stream(key, model, snapshot, { myTurn != turnId }) { chunk ->
+                GeminiClient.stream(key, model, snapshot, { myTurn != replyId }) { chunk ->
                     main.post { onChunk(myTurn, chunk) }
                 }
                 main.post { onStreamEnd(myTurn) }
@@ -439,14 +480,14 @@ class CompanionService : Service() {
     }
 
     private fun onChunk(id: Int, chunk: String) {
-        if (!active || id != turnId) return
+        if (!active || id != replyId) return
         if (!transcriptDone) {
             rawBuf.append(chunk)
             val s = rawBuf.toString()
             val nl = s.indexOf('\n')
             if (nl >= 0) {
                 acceptTranscript(s.substring(0, nl))
-                if (!active || id != turnId) return
+                if (!active || id != replyId) return
                 feedReply(s.substring(nl + 1))
             } else if (s.length > 400 && !s.trimStart().startsWith("HEARD", ignoreCase = true)) {
                 transcriptDone = true
@@ -475,12 +516,12 @@ class CompanionService : Service() {
     }
 
     private fun onStreamEnd(id: Int) {
-        if (!active || id != turnId) return
+        if (!active || id != replyId) return
         if (!transcriptDone) {
             val s = rawBuf.toString().trim()
             if (s.startsWith("HEARD", ignoreCase = true)) {
                 acceptTranscript(s)
-                if (id != turnId) return
+                if (id != replyId) return
             } else {
                 transcriptDone = true
                 heardText = "(spoken)"
@@ -495,7 +536,7 @@ class CompanionService : Service() {
     }
 
     private fun onStreamError(id: Int, e: Exception) {
-        if (!active || id != turnId) return
+        if (!active || id != replyId) return
         replyCommitted = true
         CompanionState.update { it.copy(error = e.message ?: "Unknown error") }
         speak("Sorry, I couldn't reach Gemini.")
@@ -513,7 +554,9 @@ class CompanionService : Service() {
         active = false
         turnOpen = false
         capturing = false
-        turnId++
+        watching = false
+        replyId++
+        capId++
         main.removeCallbacksAndMessages(null)
         session?.isActive = false
         session?.release()

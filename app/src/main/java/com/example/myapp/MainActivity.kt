@@ -56,6 +56,7 @@ fun CompanionScreen() {
     var model by remember { mutableStateOf(prefs.model) }
     var followUp by remember { mutableStateOf(prefs.followUp.toString()) }
     var button by remember { mutableStateOf(prefs.buttonTrigger) }
+    var barge by remember { mutableStateOf(prefs.bargeIn) }
     var pause by remember { mutableStateOf(prefs.pause) }
 
     fun save() {
@@ -63,6 +64,7 @@ fun CompanionScreen() {
         prefs.model = model.trim()
         prefs.followUp = followUp.toIntOrNull() ?: 10
         prefs.buttonTrigger = button
+        prefs.bargeIn = barge
         prefs.pause = pause
     }
 
@@ -103,6 +105,10 @@ fun CompanionScreen() {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Switch(checked = button, onCheckedChange = { button = it })
             Text("Earbud button = ask / interrupt")
+        }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Switch(checked = barge, onCheckedChange = { barge = it })
+            Text("Voice interrupt (headphones only)")
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Switch(checked = pause, onCheckedChange = { pause = it })
